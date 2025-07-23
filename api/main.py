@@ -1,11 +1,12 @@
+# api/main.py
+
 from fastapi import FastAPI
-from api.optimizer import router as optimizer_router
+from api import optimizer
+from api.schemas import OptimizeRequest
 
-app = FastAPI(title="Ammo Bundle Optimizer")
+app = FastAPI()
 
-app.include_router(optimizer_router, prefix="/optimize", tags=["optimizer"])
-
-@app.get("/")
-async def root():
-    return {"message": "Ammo Bundle Optimizer API is running."}
+@app.post("/optimize")
+def optimize_ammo_bundle(request: OptimizeRequest):
+    return optimizer.optimize_ammo_bundle(request)
 
