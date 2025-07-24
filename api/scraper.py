@@ -1,8 +1,7 @@
 import httpx
-from selectolax.parser import HTMLParser
-from urllib.parse import urlencode
-from typing import List, Optional
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from urllib.parse import urlencode
+from typing import List, Optional, Dict
 
 BASE_URL = "https://ammoseek.com/ammo/"
 
@@ -18,71 +17,64 @@ CALIBER_SLUGS = {
 def build_search_url(
     caliber: str,
     bullet_weight: Optional[int] = None,
-    search_terms: Optional[List[str]] = None
+    search_terms: Optional[List[str]] = None,
+    case_material: Optional[str] = None,
+    condition: Optional[str] = None,
+    min_shipping_rating: Optional[int] = None,
+    min_qty: Optional[int] = None,
+    max_qty: Optional[int] = None
 ) -> str:
     key = caliber.lower().replace(" ", "")
     slug = CALIBER_SLUGS.get(key, caliber)
-    params = {}
+    path = f"{BASE_URL}{slug}"
     if bullet_weight is not None:
-        params["grains"] = bullet_weight
+        path += f"/-handgun-{bullet_weight}grains"
+
+    params: Dict[str, str] = {}
+    if case_material:
+        params["ca"] = case_material.lower()
+    if condition:
+        params["co"] = condition.lower()
     if search_terms:
-        params["search"] = " ".join(search_terms)
+        params["ikw"] = " ".join(search_terms)
+    if min_qty is not None and max_qty is not None:
+        params["nr"] = f"{min_qty}-{max_qty}"
+    if min_shipping_rating is not None:
+        if min_shipping_rating >= 8:
+            params["sh"] = "low"
+        elif min_shipping_rating >= 6:
+            params["sh"] = "average"
+        elif min_shipping_rating >= 4:
+            params["sh"] = "high"
+
     query = urlencode(params)
-    return f"{BASE_URL}{slug}?{query}" if query else f"{BASE_URL}{slug}"
-
-
-def parse_search_results(html: str) -> List[dict]:
-    tree = HTMLParser(html)
-    rows = tree.css("tr[data-productid]")
-    results: List[dict] = []
-
-    for row in rows:
-        logo = row.css_first("td.logo-cell img")
-        retailer = logo.attributes.get("alt") if logo else None
-
-        price_el = row.css_first("td.price-cell")
-        price_text = price_el.text(strip=True) if price_el else ""
-        price = None
-        if price_text.startswith("$"):
-            try:
-                price = float(price_text.replace("$", "").split("/")[0])
-            except ValueError:
-                continue
-
-        ship_el = row.css_first("td.shipping-cell span.rating")
-        shipping_rating = None
-        if ship_el:
-            try:
-                shipping_rating = int(ship_el.text(strip=True))
-            except ValueError:
-                shipping_rating = None
-
-        link = row.css_first("td.description-cell a")
-        href = link.attributes.get('href') if link else None
-        product_url = f"https://ammoseek.com{href}" if href else None
-        title = link.text(strip=True) if link else None
-
-        results.append({
-            "retailer": retailer,
-            "price_per_round": price,
-            "shipping_rating": shipping_rating,
-            "product_url": product_url,
-            "title": title,
-        })
-
-    return results
+    return f"{path}?{query}" if query else path
 
 
 def scrape_ammoseek(
     caliber: str,
     bullet_weight: Optional[int] = None,
-    search_terms: Optional[List[str]] = None
-) -> List[dict]:
-    url = build_search_url(caliber, bullet_weight, search_terms)
+    search_terms: Optional[List[str]] = None,
+    case_material: Optional[str] = None,
+    condition: Optional[str] = None,
+    min_shipping_rating: Optional[int] = None,
+    min_qty: Optional[int] = None,
+    max_qty: Optional[int] = None
+) -> List[Dict]:
+    url = build_search_url(
+        caliber,
+        bullet_weight,
+        search_terms,
+        case_material,
+        condition,
+        min_shipping_rating,
+        min_qty,
+        max_qty,
+    )
     print(f"Scraping: {url}")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
         page = browser.new_page(
             user_agent=(
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5_2) "
@@ -91,20 +83,29 @@ def scrape_ammoseek(
             )
         )
         try:
-            page.goto(url, timeout=30000)
-            # Disable compact view to load full results if present
-            try:
-                compact_toggle = page.query_selector("text=Compact Results")
-                if compact_toggle:
-                    compact_toggle.click()
-            except Exception:
-                pass
-            # Wait for results to load
-            page.wait_for_selector('tr[data-productid]', timeout=15000)
+            page.goto(url, timeout=60000, wait_until="networkidle")
+            # Wait for DataTables rows
+            page.wait_for_selector("div#ammo_wrapper tbody tr", timeout=30000)
+            # Extract structured data via DOM evaluation
+            data = page.evaluate("() => { \
+                const rows = document.querySelectorAll('div#ammo_wrapper tbody tr'); \
+                return Array.from(rows).map(row => { \
+                    const cells = row.querySelectorAll('td'); \
+                    const retailer = cells[0]?.textContent.trim() || null; \
+                    const link = cells[1]?.querySelector('a'); \
+                    const title = link?.textContent.trim() || null; \
+                    const href = link?.getAttribute('href') || null; \
+                    const product_url = href ? `https://ammoseek.com${href}` : null; \
+                    const priceText = cells[2]?.textContent.trim() || ''; \
+                    const price = priceText.startsWith('$') ? parseFloat(priceText.replace('$','')) : null; \
+                    const shipEl = cells[3]?.querySelector('.displayScore'); \
+                    const shipping_rating = shipEl ? parseInt(shipEl.textContent.trim()) : null; \
+                    return { retailer, title, product_url, price_per_round: price, shipping_rating }; \
+                }); \
+            }")
         except PlaywrightTimeoutError:
             browser.close()
             return []
-        html = page.content()
         browser.close()
 
-    return parse_search_results(html)
+    return data
