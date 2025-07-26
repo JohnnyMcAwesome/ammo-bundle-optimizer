@@ -1,31 +1,24 @@
 import re
 import httpx
-from urllib.parse import urlencode
 from typing import List, Optional, Dict
 
 BASE_URL = "https://ammoseek.com"
 SEARCH_ENDPOINT = "/"
 
-# Map user-friendly caliber inputs to AmmoSeek URL slugs
 CALIBER_SLUGS = {
     "9mm":       "9mm-luger",
     "5.56":      "5.56-nato",
     "45acp":     "45-acp",
     "38special": "38-special",
-    # extend as needed
 }
 
-# Map slug to numeric caliber ID as used by AmmoSeek
 CALIBER_IDS = {
-    "9mm-luger": "82",
-    "5.56-nato": "49",
-    # add other calibers here
+    "9mm-luger":  "82",
+    "5.56-nato":  "49",
 }
 
-# Which slugs correspond to rifle calibers (to set gun parameter)
 RIFLE_SLUGS = {"5.56-nato"}
 
-# DataTables columns order expected by AmmoSeek
 COLUMNS = [
     "retailer", "descr", "mfg", "caliber", "grains", "when",
     "purchaselimit", "casing", "condition", "price", "count", "cp",
@@ -45,7 +38,7 @@ def build_search_payload(
     max_qty: Optional[int]
 ) -> Dict[str, str]:
     payload: Dict[str, str] = {}
-    # DataTables column metadata
+    # DataTables columns config
     for i, col in enumerate(COLUMNS):
         payload[f"columns[{i}][data]"] = col
         payload[f"columns[{i}][name]"] = ""
@@ -54,16 +47,16 @@ def build_search_payload(
         payload[f"columns[{i}][search][value]"] = ""
         payload[f"columns[{i}][search][regex]"] = "false"
 
-    # Paging and draw
+    # Paging & draw
     payload.update({
         "draw": "1",
         "start": "0",
         "length": str(max_qty or 100),
         "search[value]": "",
-        "search[regex]": "false"
+        "search[regex]": "false",
     })
 
-    # Filters
+    # Core filters
     payload["search_ammo"] = "1"
     if min_shipping_rating is not None:
         if min_shipping_rating >= 8:
@@ -75,7 +68,6 @@ def build_search_payload(
     if case_material:
         payload["ca"] = case_material.lower()
     payload["sort"] = ""
-    # Rifle vs handgun
     payload["gun"] = "rifle" if slug in RIFLE_SLUGS else "handgun"
     payload["cal"] = caliber_id
     if search_terms:
@@ -88,7 +80,6 @@ def build_search_payload(
     if condition:
         payload["co"] = condition.lower()
     payload["seo_name"] = slug
-
     return payload
 
 
@@ -97,49 +88,50 @@ def parse_listings(json_data: List[dict]) -> List[dict]:
     for row in json_data:
         retailer = row.get("retailer")
         descr = row.get("descr", "")
-        # strip HTML from description
-        title = re.sub(r'<[^>]+>', '', descr).strip()
+        title = re.sub(r"<[^>]+>", "", descr).strip()
+        mfg = row.get("mfg")  # the JSON field for brand
 
-        # cost-per-round (cp) comes in cents markup
-        cp_text = row.get("cp", "").replace('&#162;', '¢')
-        cp_num = None
-        match = re.search(r"([0-9]+\.?[0-9]*)", cp_text)
-        if match:
+        # price-per-round parsing
+        cp_txt = row.get("cp", "").strip()
+        cp: Optional[float] = None
+        if "¢" in cp_txt:
+            m = re.search(r"([0-9]+\.?[0-9]*)", cp_txt)
+            if m:
+                cp = float(m.group(1)) / 100.0
+        elif "$" in cp_txt:
+            m = re.search(r"([0-9]+\.?[0-9]*)", cp_txt)
+            if m:
+                cp = float(m.group(1))
+        if cp is None:
+            ptxt = row.get("price", "")
+            pnum = re.sub(r"[^0-9\.]", "", ptxt)
             try:
-                cp_num = float(match.group(1)) / 100.0
-            except ValueError:
-                cp_num = None
+                tot = float(pnum)
+                cnt = int(row.get("count", 1))
+                cp = tot / cnt
+            except:
+                cp = None
 
-        # fallback: total price / count
-        if cp_num is None:
-            price_txt = row.get("price", "")
-            price_num = re.sub(r'[^0-9\.]', '', price_txt)
-            try:
-                total_price = float(price_num)
-                count = int(row.get("count", 1))
-                cp_num = total_price / count
-            except Exception:
-                cp_num = None
-
-        # shipping rating: "free" -> 10, else numeric parse
-        ship_raw = row.get("shipping_rating", "").lower()
-        if ship_raw == "free":
-            ship_rating = 10
+        # shipping rating
+        sr = row.get("shipping_rating", "").lower()
+        if sr == "free":
+            ship = 10
         else:
-            m = re.search(r"(\d+)", ship_raw)
-            ship_rating = int(m.group(1)) if m else None
+            m2 = re.search(r"(\d+)", sr)
+            ship = int(m2.group(1)) if m2 else None
 
-        # product URL from DT_RowData.gourl
+        # product URL
         dt = row.get("DT_RowData", {})
         gourl = dt.get("gourl")
-        product_url = f"{BASE_URL}{gourl}" if gourl else None
+        url = f"{BASE_URL}{gourl}" if gourl else None
 
         listings.append({
             "retailer": retailer,
+            "mfg": mfg,
             "title": title,
-            "product_url": product_url,
-            "price_per_round": cp_num,
-            "shipping_rating": ship_rating
+            "product_url": url,
+            "price_per_round": cp,
+            "shipping_rating": ship,
         })
     return listings
 
@@ -152,52 +144,73 @@ def scrape_ammoseek(
     condition: Optional[str] = None,
     min_shipping_rating: Optional[int] = None,
     min_qty: Optional[int] = None,
-    max_qty: Optional[int] = None
+    max_qty: Optional[int] = None,
+    manufacturers: Optional[List[str]] = None
 ) -> List[dict]:
-    """
-    Perform a JSON POST to AmmoSeek's DataTables endpoint to fetch listings.
-    """
-    # Determine slug and caliber ID
     key = caliber.lower().replace(" ", "")
     slug = CALIBER_SLUGS.get(key, key)
     caliber_id = CALIBER_IDS.get(slug)
     if not caliber_id:
         raise ValueError(f"Unknown caliber slug '{slug}' for JSON API")
 
-    # Build form data
-    payload = build_search_payload(
-        slug,
-        caliber_id,
-        bullet_weight,
-        search_terms,
-        case_material,
-        condition,
+    # Fetch raw listings once
+    raw = _fetch_listings(
+        slug, caliber_id,
+        bullet_weight, search_terms,
+        case_material, condition,
         min_shipping_rating,
-        min_qty,
-        max_qty
+        min_qty, max_qty
     )
 
+    # Apply Python-side, case-insensitive manufacturer filter
+    if manufacturers:
+        allowed = {m.lower() for m in manufacturers}
+        raw = [l for l in raw if (l.get("mfg") or "").lower() in allowed]
+
+    # Deduplicate by URL
+    seen = set()
+    unique = []
+    for l in raw:
+        url = l.get("product_url")
+        if url and url not in seen:
+            seen.add(url)
+            unique.append(l)
+
+    return unique
+
+
+def _fetch_listings(
+    slug: str,
+    caliber_id: str,
+    bullet_weight: Optional[int],
+    search_terms: Optional[List[str]],
+    case_material: Optional[str],
+    condition: Optional[str],
+    min_shipping_rating: Optional[int],
+    min_qty: Optional[int],
+    max_qty: Optional[int]
+) -> List[dict]:
+    payload = build_search_payload(
+        slug, caliber_id,
+        bullet_weight, search_terms,
+        case_material, condition,
+        min_shipping_rating,
+        min_qty, max_qty
+    )
     headers = {
         "User-Agent": "Mozilla/5.0",
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
         "X-Requested-With": "XMLHttpRequest",
-        # Use correct referer for rifle vs handgun
-        "Referer": (
-            f"{BASE_URL}/ammo/{slug}/" if bullet_weight is None else \
-            f"{BASE_URL}/ammo/{slug}/-handgun-{bullet_weight}grains"
-        )
+        "Referer": f"{BASE_URL}/ammo/{slug}/",
     }
-
     with httpx.Client() as client:
-        # fetch page first to get any cookies if needed
         client.get(f"{BASE_URL}/ammo/{slug}/")
         resp = client.post(
             BASE_URL + SEARCH_ENDPOINT,
             data=payload,
-            headers=headers,
+            headers=headers
         )
         resp.raise_for_status()
-        result = resp.json()
-
-    return parse_listings(result.get("data", []))
+        data = resp.json().get("data", [])
+    return parse_listings(data)
